@@ -70,7 +70,8 @@ class PartitionedRegressor:
                  leaf_cap=15, max_leaf_cap=60, top_k=3,
                  small_data_rows=5000, n_folds=3, val_fraction=0.2,
                  search_time_limit=None, final_fit_kwargs=None,
-                 learner="autogluon", learner_params=None, compare_global=False,
+                 learner="autogluon", learner_params=None, selection_learner="auto",
+                 compare_global=False,
                  random_state=42, verbosity=1):
         """See the README for all options."""
         if split not in ("random", "chronological"):
@@ -79,6 +80,8 @@ class PartitionedRegressor:
             raise ValueError("split='chronological' needs time_col")
         if isinstance(learner, str) and learner not in LEARNERS:
             raise ValueError(f"learner must be one of {LEARNERS} or an sklearn-style regressor")
+        if isinstance(selection_learner, str) and selection_learner not in LEARNERS + ("auto",):
+            raise ValueError(f"selection_learner must be 'auto', one of {LEARNERS} or an sklearn-style regressor")
         self.label = label
         self.path = path
         self.split = split
@@ -96,6 +99,7 @@ class PartitionedRegressor:
         self.final_fit_kwargs = final_fit_kwargs or {"presets": "medium", "auto_stack": False}
         self.learner = learner
         self.learner_params = learner_params
+        self.selection_learner = selection_learner
         self.compare_global = compare_global
         self.random_state = random_state
         self.verbosity = verbosity
@@ -111,7 +115,7 @@ class PartitionedRegressor:
         ]
         self.n_train_ = n
         self._log(f"Fitting on {n} rows, {len(self.feature_cols_)} features, {self.split} splits, "
-                  f"learner={self._learner_name()}")
+                  f"learner={self._learner_name()}, selection learner={self._learner_name(self._selection())}")
 
         rank = self._time_rank(data)
         X, y = self._tree_matrix(data), data[self.label]
@@ -119,8 +123,16 @@ class PartitionedRegressor:
         if self.search:
             candidates = self._generate_candidates(X, y, rank)
             candidates = self._check_on_full_data(candidates, X, y)
-            self.search_results_ = self._score_candidates(candidates, data, rank)
-            self.chosen_ = self._select(self.search_results_)
+            if len(candidates) == 1:
+                self._log("Only one distinct partition left: skipping stage 2")
+                self.search_results_ = pd.DataFrame([{**candidates[0], "val_rmse": np.nan,
+                                                      "val_se": np.nan, "chosen": True}])
+                cand = candidates[0]
+                self.chosen_ = {"source": cand["source"], "min_samples_leaf": int(cand["min_samples_leaf"]),
+                                "cap": int(cand["cap"]), "max_leaf_nodes": int(cand["max_leaf_nodes"])}
+            else:
+                self.search_results_ = self._score_candidates(candidates, data, rank)
+                self.chosen_ = self._select(self.search_results_)
         else:
             self.search_results_ = None
             msl = default_min_samples_leaf(n)
@@ -174,7 +186,7 @@ class PartitionedRegressor:
     def summary(self):
         return (f"CART partition with {self._final['tree'].get_n_leaves()} leaves, "
                 f"min_samples_leaf={self.chosen_['min_samples_leaf']} ({self.chosen_['source']}), "
-                f"learner={self._learner_name()}")
+                f"learner={self._learner_name()}, selection learner={self._learner_name(self._selection())}")
 
     def save(self):
         os.makedirs(self.path, exist_ok=True)
@@ -291,10 +303,12 @@ class PartitionedRegressor:
     def _check_on_full_data(self, candidates, X, y):
         """Fits each candidate's tree on the full training set so the scored
         partition is the one that gets deployed: drops candidates that collapse
-        to 1 leaf, uses the leaf count the tree really reaches, and removes
-        duplicates this creates."""
-        checked, seen = [], set()
-        for cand in candidates:
+        to 1 leaf, uses the leaf count the tree really reaches, and merges
+        candidates that split the rows identically (keeping the larger
+        min_samples_leaf)."""
+        checked, seen, partitions = [], set(), {}
+        order = sorted(range(len(candidates)), key=lambda i: -candidates[i]["min_samples_leaf"])
+        for cand in (candidates[i] for i in order):
             tree = DecisionTreeRegressor(max_leaf_nodes=int(cand["max_leaf_nodes"]),
                                          min_samples_leaf=int(cand["min_samples_leaf"]),
                                          random_state=self.random_state).fit(X, y)
@@ -309,6 +323,14 @@ class PartitionedRegressor:
             if key in seen:
                 continue
             seen.add(key)
+            leaves = tree.apply(X)
+            _, first = np.unique(leaves, return_index=True)
+            relabel = {leaf: rank for rank, leaf in enumerate(leaves[np.sort(first)])}
+            signature = np.vectorize(relabel.get)(leaves).astype(np.int32).tobytes()
+            if signature in partitions:
+                self._log(f"  merged {self._describe(cand)}: same partition as {self._describe(partitions[signature])}")
+                continue
+            partitions[signature] = cand
             checked.append(cand)
         if not checked:
             raise ValueError("No candidate splits the full training set into 2 or more leaves.")
@@ -349,7 +371,8 @@ class PartitionedRegressor:
     def _score_candidates(self, candidates, data, rank):
         splits = self._validation_splits(len(data), rank)
         scheme = f"{len(splits)}-fold CV" if len(splits) > 1 else "holdout"
-        self._log(f"Stage 2: scoring end-to-end with {self.split} {scheme}")
+        self._log(f"Stage 2: scoring end-to-end with {self.split} {scheme}, "
+                  f"learner={self._learner_name(self._selection())}")
         search_kwargs = dict(self.final_fit_kwargs)
         if self.search_time_limit is not None:
             search_kwargs["time_limit"] = self.search_time_limit
@@ -362,7 +385,7 @@ class PartitionedRegressor:
                     work_dir = os.path.join(search_dir, f"cand{i}_fold{j}")
                     train_part, val_part = data.iloc[tr], data.iloc[va]
                     fitted = self._fit_candidate(cand, train_part, work_dir, search_kwargs,
-                                                 n_reference=len(data))
+                                                 n_reference=len(data), learner=self._selection())
                     preds = self._predict_fitted(fitted, val_part)
                     shutil.rmtree(work_dir, ignore_errors=True)
                     err = val_part[self.label].to_numpy(dtype=float) - preds
@@ -406,22 +429,32 @@ class PartitionedRegressor:
     def _is_autogluon(self):
         return isinstance(self.learner, str) and self.learner == "autogluon"
 
-    def _learner_name(self):
-        return self.learner if isinstance(self.learner, str) else type(self.learner).__name__
+    def _learner_name(self, learner=None):
+        learner = self.learner if learner is None else learner
+        return learner if isinstance(learner, str) else type(learner).__name__
 
-    def _train_model(self, df, path, fit_kwargs, ag_verbosity=0):
+    def _selection(self):
+        """Learner used to score candidates in stage 2. 'auto' = CatBoost when the
+        final learner is AutoGluon, otherwise the final learner itself."""
+        if isinstance(self.selection_learner, str) and self.selection_learner == "auto":
+            return "catboost" if self._is_autogluon() else self.learner
+        return self.selection_learner
+
+    def _train_model(self, df, path, fit_kwargs, ag_verbosity=0, learner=None):
         """One leaf model. fit_kwargs and path are only used by AutoGluon."""
-        if self._is_autogluon():
+        learner = self.learner if learner is None else learner
+        if isinstance(learner, str) and learner == "autogluon":
             from autogluon.tabular import TabularPredictor
             shutil.rmtree(path, ignore_errors=True)
             return TabularPredictor(
                 label=self.label, eval_metric="rmse", problem_type="regression",
                 path=path, verbosity=ag_verbosity,
             ).fit(df, **fit_kwargs)
-        model = make_model(self.learner, self.learner_params, self.random_state)
+        params = self.learner_params if (learner is self.learner or learner == self.learner) else None
+        model = make_model(learner, params, self.random_state)
         return model.fit(df[self.feature_cols_], df[self.label])
 
-    def _fit_candidate(self, cand, data, work_dir, fit_kwargs, n_reference=None, ag_verbosity=0):
+    def _fit_candidate(self, cand, data, work_dir, fit_kwargs, n_reference=None, ag_verbosity=0, learner=None):
         """Trains one candidate on `data`. With n_reference, min_samples_leaf
         is rescaled from n_reference rows to len(data) rows."""
         model_data = data[self.feature_cols_ + [self.label]]
@@ -437,7 +470,7 @@ class PartitionedRegressor:
         for leaf_id in np.unique(leaf_ids):
             predictors[int(leaf_id)] = self._train_model(
                 model_data[leaf_ids == leaf_id], os.path.join(work_dir, f"leaf_{leaf_id}"),
-                fit_kwargs, ag_verbosity,
+                fit_kwargs, ag_verbosity, learner=learner,
             )
         return {"features": features, "tree": tree, "predictors": predictors}
 
