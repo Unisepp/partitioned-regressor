@@ -87,7 +87,7 @@ For all other learners, the learner itself scores the candidates.
 
 ## How `fit()` works
 
-1. **Candidates.** For each `min_samples_leaf` value, a CART-only k-fold CV is run over leaf counts. The leaf cap starts at 15 and doubles (up to 60) while the lowest CV RMSE sits exactly on the cap. The 1-SE rule picks one leaf count per cap level (2-15, 2-30, ...). The default value (5% of the rows, clipped to 300-800) and the 3 other values with the lowest CV RMSE are kept, each with all its picks.
+1. **Candidates.** For each `min_samples_leaf` value, a CART-only k-fold CV is run over leaf counts. The leaf cap starts at 15 and doubles (up to 60) while the lowest CV RMSE sits exactly on the cap. The 1-SE rule picks one leaf count per cap level (2-15, 2-30, ...). These CART curves always use random folds (`cart_cv="random"`): this stage only proposes candidates, and the time order is respected where the decision is made (scoring and selection). The default value (5% of the rows, clipped to 300-800) and the 3 other values with the lowest CV RMSE are kept, each with all its picks.
 2. **Full-data check.** Each candidate's tree is fit on the full training set. Candidates that collapse to 1 leaf are dropped; the leaf count is set to what the tree reaches. Candidates that split the rows identically are merged. If only one partition is left, scoring is skipped.
 3. **Scoring.** Each candidate is trained per leaf with the selection learner and scored on validation data: k-fold CV below 5,000 rows, one holdout split above.
 4. **Selection.** The simplest candidate within one standard error of the best wins (fewer leaves, then larger `min_samples_leaf`).
@@ -116,6 +116,7 @@ For all other learners, the learner itself scores the candidates.
 | `final_fit_kwargs` | `presets="medium", auto_stack=False` | Passed to AutoGluon's `fit`, also used in the search. |
 | `learner` | `"autogluon"` | Leaf model, see above. |
 | `learner_params` | `None` | Constructor arguments for non-AutoGluon learners. |
+| `cart_cv` | `"random"` | Folds for the CART curves in step 1. `"split"` uses the same folds as `split` (chronological if set). |
 | `selection_learner` | `"auto"` | Learner that scores the candidates. `"auto"`: CatBoost when `learner="autogluon"`, otherwise `learner` itself. Set `selection_learner="autogluon"` for the exact (slow) AutoGluon search. |
 | `compare_global` | `False` | Also train a global model; `evaluate()` then reports both and the improvement. |
 | `random_state` | `42` | Seed. |

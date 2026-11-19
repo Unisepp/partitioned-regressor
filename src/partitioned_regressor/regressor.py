@@ -70,7 +70,7 @@ class PartitionedRegressor:
                  leaf_cap=15, max_leaf_cap=60, top_k=3,
                  small_data_rows=5000, n_folds=3, val_fraction=0.2,
                  search_time_limit=None, final_fit_kwargs=None,
-                 learner="autogluon", learner_params=None, selection_learner="auto",
+                 learner="autogluon", learner_params=None, selection_learner="auto", cart_cv="random",
                  compare_global=False,
                  random_state=42, verbosity=1):
         """See the README for all options."""
@@ -82,6 +82,8 @@ class PartitionedRegressor:
             raise ValueError(f"learner must be one of {LEARNERS} or an sklearn-style regressor")
         if isinstance(selection_learner, str) and selection_learner not in LEARNERS + ("auto",):
             raise ValueError(f"selection_learner must be 'auto', one of {LEARNERS} or an sklearn-style regressor")
+        if cart_cv not in ("random", "split"):
+            raise ValueError("cart_cv must be 'random' or 'split'")
         self.label = label
         self.path = path
         self.split = split
@@ -100,6 +102,7 @@ class PartitionedRegressor:
         self.learner = learner
         self.learner_params = learner_params
         self.selection_learner = selection_learner
+        self.cart_cv = cart_cv
         self.compare_global = compare_global
         self.random_state = random_state
         self.verbosity = verbosity
@@ -346,7 +349,7 @@ class PartitionedRegressor:
             idx = np.sort(np.random.default_rng(self.random_state).choice(n_full, CART_SAMPLE_CAP, replace=False))
             X, y = X.iloc[idx], y.iloc[idx]
             rank = None if rank is None else rank[idx]
-        folds = self._cv_folds(len(X), rank)
+        folds = self._cv_folds(len(X), rank if self.cart_cv == "split" else None)
         fold_msl = [max(1, int(round(min_samples_leaf * len(tr) / n_full))) for tr, _ in folds]
 
         curve, leaves, cap = [], 2, self.leaf_cap
